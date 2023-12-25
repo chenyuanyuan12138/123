@@ -1,0 +1,290 @@
+import ee
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from scipy.optimize import curve_fit
+
+# 初始化 Google Earth Engine
+ee.Initialize()
+
+# 设置经纬度和日期范围
+longitude = 126.64
+latitude = 45.705
+point = ee.Geometry.Point(longitude, latitude)
+start_date = '2021-01-01'
+end_date = '2021-12-31'
+
+# 加载 MODIS 每日表面反射率产品
+modis_daily_reflectance = ee.ImageCollection('MODIS/006/MOD09GA').filterDate(start_date, end_date)
+
+# 计算每日 NDVI
+def calculate_daily_ndvi(image):
+    nir = image.select('sur_refl_b02').multiply(0.0001)
+    red = image.select('sur_refl_b01').multiply(0.0001)
+    ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI')
+    return image.addBands(ndvi).set('system:time_start', image.get('system:time_start'))
+
+# 映射函数计算每张影像的 NDVI
+ndvi_daily = modis_daily_reflectance.map(calculate_daily_ndvi)
+
+def mask_clouds(image):
+    qa = image.select('state_1km')
+    cloud_mask = qa.bitwiseAnd(1 << 10).eq(0)
+    return image.updateMask(cloud_mask)
+
+# 映射函数以剔除云覆盖
+ndvi_daily_no_clouds = ndvi_daily.map(mask_clouds)
+
+# 提取每日 NDVI 时间序列
+def get_daily_ndvi_timeseries(image_collection, geom):
+    def extract(image):
+        date = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd')
+        ndvi = image.select('NDVI').reduceRegion(ee.Reducer.mean(), geom, 500).get('NDVI')
+        return ee.Feature(None, {'date': date, 'NDVI': ndvi})
+    
+    timeseries = image_collection.map(extract).filter(ee.Filter.notNull(['NDVI']))
+    data = timeseries.getInfo()
+    dates = [d['properties']['date'] for d in data['features']]
+    ndvi_values = [d['properties']['NDVI'] for d in data['features']]
+    df = pd.DataFrame({'date': dates, 'NDVI': ndvi_values})
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    return df
+
+# 使用函数获取时间序列
+ndvi_timeseries_df = get_daily_ndvi_timeseries(ndvi_daily_no_clouds, point)
+
+# 创建完整的日期范围序列
+full_df = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date))
+full_df['NDVI'] = np.nan
+full_df.update(ndvi_timeseries_df)
+
+# 应用 Savitzky-Golay 滤波器平滑 NDVI 数据
+window_length = 51  # 尽可能使用较大的窗口长度
+if len(full_df) < window_length:
+    window_length = len(full_df) // 2 * 2 + 1  # 确保窗口长度为奇数
+polyorder = 3
+smoothed_ndvi = savgol_filter(full_df['NDVI'].interpolate(), window_length, polyorder)
+
+# 定义双 Logistic 函数
+def double_logistic(x, L1, k1, x01, P01, L2, k2, x02, P02):
+    return (L1 / (1 + np.exp(-k1 * (x - x01))) + P01) * (1 - L2 / (1 + np.exp(-k2 * (x - x02))) + P02)
+
+# 计算年中点用于初始化参数
+mid_year = len(full_df) // 2
+
+# 初始化参数
+p0 = [max(smoothed_ndvi), 0.1, mid_year//2, min(smoothed_ndvi), 
+      -max(smoothed_ndvi), -0.1, mid_year + (mid_year//2), min(smoothed_ndvi)]
+
+# 设置边界
+bounds = ([0, 0, 0, 0, -np.inf, -np.inf, mid_year, -np.inf], 
+          [np.inf, np.inf, mid_year, np.inf, 0, 0, len(smoothed_ndvi), np.inf])
+
+# 拟合双 Logistic 函数
+days = np.arange(len(smoothed_ndvi))
+popt, pcov = curve_fit(double_logistic, days, smoothed_ndvi, p0=p0, bounds=bounds)
+
+# 计算拟合的 NDVI
+fitted_ndvi = double_logistic(days, *popt)
+
+# 计算一阶和三阶导数
+first_derivative = np.gradient(fitted_ndvi)
+third_derivative = np.gradient(np.gradient(np.gradient(fitted_ndvi)))
+
+# 假设已经有了 full_df, days, fitted_ndvi, first_derivative, third_derivative
+
+# 计算175天前的三阶导数梯度
+third_derivative_grad_before_175 = np.gradient(third_derivative[:175])
+
+# 计算一阶导数
+first_derivative = np.gradient(fitted_ndvi)
+
+# 春季生长阈值
+spring_growth_threshold = 0.1
+spring_decline_threshold = 0.1
+
+# 在50到175天之间寻找第一次三阶导数小于0的点
+third_derivative_negative_indices = np.where(third_derivative[50:176] < 0)[0]
+
+if len(third_derivative_negative_indices) > 0:
+    # 如果找到了符合条件的索引，选择第一个，并调整索引值为全局索引
+    sos_idx = third_derivative_negative_indices[0] + 50
+else:
+    # 如果没有找到符合条件的索引
+    sos_idx = None
+
+# 输出结果
+if sos_idx is not None:
+    print(f"SOS索引为: {sos_idx}")
+else:
+    print("在指定的50至175天的数据范围内没有找到第一次三阶导数小于0的点。")
+
+
+
+# 寻找240天以前三阶导数最小值的索引，这表示春季生长旺盛期（MOS）
+mos_idx = np.argmin(third_derivative[:240])
+
+
+
+# 春季生长季结束（EOS）：在240天以前，位于MOS后面的三阶导数开始再次增加的点
+# 在140到240天之间寻找第一次三阶导数大于0的点
+third_derivative_positive_indices = np.where(third_derivative[120:241] > 0)[0]
+
+if len(third_derivative_positive_indices) > 0:
+    # 如果找到了符合条件的索引，选择第一个，并调整索引值为全局索引
+    eos_idx = third_derivative_positive_indices[0] + 120
+else:
+    # 如果没有找到符合条件的索引
+    eos_idx = None
+
+# 输出结果
+if eos_idx is not None:
+    print(f"EOS索引为: {eos_idx}")
+else:
+    print("在指定的140至240天的数据范围内没有找到第一次三阶导数大于0的点。")
+
+
+
+
+
+def find_first_local_minima_after_day(derivative, start_day):
+    """
+    Find the index of the first local minimum in the derivative after a given start day.
+    
+    Parameters:
+    derivative (numpy array): The array of derivative values.
+    start_day (int): The day after which to look for the local minimum.
+    
+    Returns:
+    int: The index of the first local minimum, or None if no local minimum is found.
+    """
+    # Define a window size for the local minimum search. The choice of window size
+    # might depend on the expected variability of the data.
+    window_size = 5
+
+    # Start the search from the start_day
+    for i in range(start_day, len(derivative) - window_size):
+        window = derivative[i:i+window_size]
+        # Check if the current point is a local minimum
+        if window[1] > window[0] and all(window[2:] > window[1]):
+            return i + 1  # Return the index of the local minimum
+    return None
+
+# 寻找240天以后第一次出现的局部极低值点
+sof_idx = find_first_local_minima_after_day(third_derivative, 240)
+
+# 输出结果
+if sof_idx is not None:
+    print(f"SOF索引为: {sof_idx}")
+else:
+    print("在240天以后没有找到三阶导数的局部极低值点。")
+
+
+
+
+
+          
+
+
+# 秋季旺盛期（MOF）：在240天以后，三阶导数的最高值的点
+def find_local_maximum_after_day(derivative, start_day):
+    # 从start_day开始，寻找第一个局部最大值
+    for i in range(start_day, len(derivative)-2):
+        # 寻找局部最大值：前一个值小于当前值，后一个值也小于当前值
+        if derivative[i-1] < derivative[i] > derivative[i+1]:
+            return i
+    return None
+
+# 寻找240天以后三阶导数的局部极高值点
+mof_idx = find_local_maximum_after_day(third_derivative, 240)
+
+# 输出结果
+if mof_idx is not None:
+    print(f"MOF索引为: {mof_idx}")
+else:
+    print("在240天以后没有找到三阶导数的局部极高值点。")
+
+
+
+# 寻找第一个局部最小值点的函数
+def find_second_local_minimum_after_day(derivative, start_day):
+    # 从start_day开始，寻找第一个局部最小值
+    first_min_found = False
+    for i in range(start_day, len(derivative)-2):
+        # 寻找局部最小值：前一个值大于当前值，后一个值也大于当前值
+        if derivative[i-1] > derivative[i] < derivative[i+1]:
+            if first_min_found:
+                return i
+            first_min_found = True
+    return None
+
+# 寻找240天以后第二次出现的局部极低值点
+eof_idx = find_second_local_minimum_after_day(third_derivative, 240)
+
+# 输出结果
+if eof_idx is not None:
+    print(f"EOF索引为: {eof_idx}")
+else:
+    print("在240天以后没有找到第二次三阶导数的局部极低值点。")
+
+
+
+# 转换索引为日期
+sos_date = full_df.index[sos_idx] if sos_idx < len(full_df) else None
+mos_date = full_df.index[mos_idx] if mos_idx < len(full_df) else None
+eos_date = full_df.index[eos_idx] if eos_idx < len(full_df) else None
+sof_date = full_df.index[sof_idx] if sof_idx < len(full_df) else None
+mof_date = full_df.index[mof_idx] if mof_idx < len(full_df) else None
+eof_date = full_df.index[eof_idx] if eof_idx < len(full_df) else None
+
+# 绘制图形
+fig, ax1 = plt.subplots(figsize=(14, 7))
+ax1.plot(full_df.index, fitted_ndvi, label='Fitted NDVI', color='orange')
+ax1.scatter(full_df.index, full_df['NDVI'], color='green', label='Original NDVI', alpha=0.5)
+
+# 设置图例和轴标签
+ax1.legend()
+ax1.set_xlabel('日期')
+ax1.set_ylabel('NDVI值和导数')
+# 绘制物候曲线图和拟合曲线
+fig, ax1 = plt.subplots(figsize=(14, 7))
+color_ndvi = 'tab:green'
+color_derivative = 'tab:blue'
+color_third_derivative = 'tab:red'
+
+# 设置 NDVI 曲线
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Vegetation Index', color=color_ndvi)
+ax1.plot(full_df.index, fitted_ndvi, label='Fitted NDVI', color='orange')
+ax1.scatter(full_df.index, full_df['NDVI'], color=color_ndvi, label='Original NDVI', alpha=0.5)
+ax1.tick_params(axis='y', labelcolor=color_ndvi)
+
+# 设置一阶导数曲线
+ax2 = ax1.twinx()
+ax2.set_ylabel('First Derivative', color=color_derivative)
+ax2.plot(full_df.index, first_derivative, label='First Derivative', color=color_derivative)
+ax2.tick_params(axis='y', labelcolor=color_derivative)
+
+# 设置三阶导数曲线
+ax3 = ax1.twinx()
+ax3.spines['right'].set_position(('outward', 60))  # 将三阶导数的轴向右移动
+ax3.set_ylabel('Third Derivative', color=color_third_derivative)
+ax3.plot(full_df.index, third_derivative, label='Third Derivative', color=color_third_derivative)
+ax3.tick_params(axis='y', labelcolor=color_third_derivative)
+
+# 标记物候期
+ax1.axvline(x=sos_date, color='cyan', linestyle='--', lw=2, label='SOS')
+ax1.axvline(x=eos_date, color='magenta', linestyle='--', lw=2, label='EOS')
+ax1.axvline(x=mos_date, color='yellow', linestyle='--', lw=2, label='MOS')
+ax1.axvline(x=sof_date, color='grey', linestyle='--', lw=2, label='SOF')
+ax1.axvline(x=mof_date, color='black', linestyle='--', lw=2, label='MOF')
+ax1.axvline(x=eof_date, color='purple', linestyle='--', lw=2, label='EOF')
+plt.title(f'Phenology Curve at Location ({longitude}, {latitude})')
+fig.tight_layout()  # 调整布局以防止重叠
+ax1.legend(loc='upper left')
+ax2.legend(loc='upper right')
+ax3.legend(loc='lower right')
+
+plt.show()
